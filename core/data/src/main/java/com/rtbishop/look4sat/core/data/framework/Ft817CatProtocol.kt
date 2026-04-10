@@ -24,8 +24,11 @@ object Ft817CatProtocol {
     const val CMD_SET_MODE: Byte = 0x07
     const val CMD_PTT_ON: Byte = 0x08
     const val CMD_PTT_OFF: Byte = 0x88.toByte()
+    const val CMD_SPLIT_ON: Byte = 0x02
+    const val CMD_SPLIT_OFF: Byte = 0x82.toByte()
     const val CMD_CTCSS_MODE: Byte = 0x0A
     const val CMD_CTCSS_TONE: Byte = 0x0B
+    const val CMD_TOGGLE_VFO: Byte = 0x81.toByte()
 
     const val CTCSS_ENC_ON: Byte = 0x2A
     const val CTCSS_OFF: Byte = 0x8A.toByte()
@@ -119,6 +122,18 @@ object Ft817CatProtocol {
     fun buildSetCtcssToneCommand(toneHz: Double): ByteArray {
         val bcd = encodeCtcssToneBcd(toneHz)
         return byteArrayOf(bcd[0], bcd[1], 0x00, 0x00, CMD_CTCSS_TONE)
+    }
+
+    fun buildToggleVfoCommand(): ByteArray {
+        return byteArrayOf(0x00, 0x00, 0x00, 0x00, CMD_TOGGLE_VFO)
+    }
+
+    fun buildSplitOnCommand(): ByteArray {
+        return byteArrayOf(0x00, 0x00, 0x00, 0x00, CMD_SPLIT_ON)
+    }
+
+    fun buildSplitOffCommand(): ByteArray {
+        return byteArrayOf(0x00, 0x00, 0x00, 0x00, CMD_SPLIT_OFF)
     }
 
     /**

@@ -155,6 +155,9 @@
     <string name="rc_tx_name_hint">TX Radio Name</string>
     <string name="rc_rx_name_hint">RX Radio Name</string>
     <string name="rc_enable_switch">Enable CAT Control</string>
+    <string name="rc_operating_mode">Operating Mode</string>
+    <string name="rc_mode_duplex">Duplex (2 Radios)</string>
+    <string name="rc_mode_simplex">Simplex (Split VFO)</string>
 
     <string name="prefs_net_title">Network data output</string>
     <string name="prefs_net_rotator_switch">Enable rotation output</string>

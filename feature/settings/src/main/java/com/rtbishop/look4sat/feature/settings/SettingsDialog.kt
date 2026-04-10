@@ -448,6 +448,7 @@ fun RadioControlDialog(
     val padding = LocalSpacing.current.large
     val baudRates = listOf(4800, 9600, 38400)
     val enabled = rememberSaveable { mutableStateOf(initialSettings.enabled) }
+    val operatingMode = rememberSaveable { mutableStateOf(initialSettings.operatingMode) }
     val radioModel = rememberSaveable { mutableStateOf(initialSettings.radioModel) }
     val txAddress = rememberSaveable { mutableStateOf(initialSettings.txRadioAddress) }
     val rxAddress = rememberSaveable { mutableStateOf(initialSettings.rxRadioAddress) }
@@ -455,6 +456,7 @@ fun RadioControlDialog(
     val rxName = rememberSaveable { mutableStateOf(initialSettings.rxRadioName) }
     val baudRate = rememberSaveable { mutableIntStateOf(initialSettings.baudRate) }
     val selectingFor = rememberSaveable { mutableStateOf("") } // "tx", "rx", or ""
+    val isSimplex = operatingMode.value == RadioControlSettings.MODE_SIMPLEX
 
     val pairedDevices = remember {
         try {
@@ -469,6 +471,7 @@ fun RadioControlDialog(
         onSave(
             RadioControlSettings(
                 enabled = enabled.value,
+                operatingMode = operatingMode.value,
                 radioModel = radioModel.value,
                 txRadioAddress = txAddress.value,
                 rxRadioAddress = rxAddress.value,
@@ -495,6 +498,28 @@ fun RadioControlDialog(
             }
             Spacer(modifier = Modifier.height(6.dp))
 
+            // Operating mode selection
+            Text(
+                stringResource(R.string.rc_operating_mode),
+                fontWeight = androidx.compose.ui.text.font.FontWeight.Medium,
+                color = androidx.compose.material3.MaterialTheme.colorScheme.primary
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                androidx.compose.material3.FilterChip(
+                    selected = !isSimplex,
+                    onClick = { operatingMode.value = RadioControlSettings.MODE_DUPLEX },
+                    label = { Text(stringResource(R.string.rc_mode_duplex), fontSize = 12.sp) },
+                    enabled = enabled.value
+                )
+                androidx.compose.material3.FilterChip(
+                    selected = isSimplex,
+                    onClick = { operatingMode.value = RadioControlSettings.MODE_SIMPLEX },
+                    label = { Text(stringResource(R.string.rc_mode_simplex), fontSize = 12.sp) },
+                    enabled = enabled.value
+                )
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+
             // Radio model selection
             Text(
                 stringResource(R.string.rc_radio_model),
@@ -513,28 +538,33 @@ fun RadioControlDialog(
             }
             Spacer(modifier = Modifier.height(6.dp))
 
-            // TX Radio selection
-            Text("TX Radio (Uplink)", fontWeight = androidx.compose.ui.text.font.FontWeight.Medium)
+            // TX Radio selection (or single radio in simplex mode)
+            Text(
+                if (isSimplex) "Radio" else "TX Radio (Uplink)",
+                fontWeight = androidx.compose.ui.text.font.FontWeight.Medium
+            )
             if (txAddress.value.isNotBlank()) {
                 Text("${txName.value} - ${txAddress.value}", fontSize = 13.sp)
             }
             CardButton(
                 onClick = { selectingFor.value = "tx" },
-                text = "Select TX Device",
+                text = if (isSimplex) "Select Radio" else "Select TX Device",
                 modifier = Modifier.fillMaxWidth()
             )
             Spacer(modifier = Modifier.height(6.dp))
 
-            // RX Radio selection
-            Text("RX Radio (Downlink)", fontWeight = androidx.compose.ui.text.font.FontWeight.Medium)
-            if (rxAddress.value.isNotBlank()) {
-                Text("${rxName.value} - ${rxAddress.value}", fontSize = 13.sp)
+            // RX Radio selection (hidden in simplex mode)
+            if (!isSimplex) {
+                Text("RX Radio (Downlink)", fontWeight = androidx.compose.ui.text.font.FontWeight.Medium)
+                if (rxAddress.value.isNotBlank()) {
+                    Text("${rxName.value} - ${rxAddress.value}", fontSize = 13.sp)
+                }
+                CardButton(
+                    onClick = { selectingFor.value = "rx" },
+                    text = "Select RX Device",
+                    modifier = Modifier.fillMaxWidth()
+                )
             }
-            CardButton(
-                onClick = { selectingFor.value = "rx" },
-                text = "Select RX Device",
-                modifier = Modifier.fillMaxWidth()
-            )
 
             // Paired devices list (shown when selecting)
             if (selectingFor.value.isNotBlank()) {

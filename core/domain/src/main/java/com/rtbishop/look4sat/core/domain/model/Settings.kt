@@ -66,6 +66,7 @@ data class DataSourcesSettings(
 
 data class RadioControlSettings(
     val enabled: Boolean,
+    val operatingMode: String,
     val radioModel: String,
     val txRadioAddress: String,
     val rxRadioAddress: String,
@@ -73,10 +74,15 @@ data class RadioControlSettings(
     val rxRadioName: String,
     val baudRate: Int
 ) {
+    val isSimplex: Boolean get() = operatingMode == MODE_SIMPLEX
+
     companion object {
+        const val MODE_DUPLEX = "duplex"
+        const val MODE_SIMPLEX = "simplex"
         val SUPPORTED_RADIOS = listOf(
             "Yaesu FT-817/818",
-            "Yaesu FT-857/897"
+            "Yaesu FT-857/897",
+            "Icom IC-705"
         )
     }
 }

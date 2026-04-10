@@ -38,4 +38,8 @@ interface IRadioController {
     suspend fun pttOn(): Boolean
 
     suspend fun pttOff(): Boolean
+
+    suspend fun toggleVfo(): Boolean
+
+    suspend fun setSplit(enabled: Boolean): Boolean
 }

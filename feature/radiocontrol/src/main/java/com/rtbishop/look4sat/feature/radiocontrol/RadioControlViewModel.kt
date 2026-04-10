@@ -116,17 +116,18 @@ class RadioControlViewModel(
         // Observe service state for radio-specific updates (panels, frequencies, tracking status)
         viewModelScope.launch {
             trackingService.state.collect { svc ->
+                val isSimplex = settingsRepo.radioControlSettings.value.isSimplex
                 _uiState.update { state ->
                     state.copy(
                         txPanel = RadioPanelState(
-                            label = "TX (Uplink)",
+                            label = if (isSimplex) "TX / VFO B" else "TX (Uplink)",
                             isConnected = svc.txConnected,
                             frequencyHz = svc.txFrequencyHz,
                             frequencyDisplay = svc.txFrequencyHz?.let { formatFrequency(it) } ?: "---",
                             mode = svc.txMode
                         ),
                         rxPanel = RadioPanelState(
-                            label = "RX (Downlink)",
+                            label = if (isSimplex) "RX / VFO A" else "RX (Downlink)",
                             isConnected = svc.rxConnected,
                             frequencyHz = svc.rxFrequencyHz,
                             frequencyDisplay = svc.rxFrequencyHz?.let { formatFrequency(it) } ?: "---",

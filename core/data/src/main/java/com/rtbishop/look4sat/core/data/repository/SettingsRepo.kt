@@ -368,6 +368,7 @@ class SettingsRepo(
 
     //region # Radio control settings
     private val keyRadioControlEnabled = "radioControlEnabled"
+    private val keyOperatingMode = "operatingMode"
     private val keyRadioModel = "radioModel"
     private val keyTxRadioAddress = "txRadioAddress"
     private val keyRxRadioAddress = "rxRadioAddress"
@@ -381,6 +382,7 @@ class SettingsRepo(
     override fun updateRadioControlSettings(settings: RadioControlSettings) {
         preferences.edit {
             putBoolean(keyRadioControlEnabled, settings.enabled)
+            putString(keyOperatingMode, settings.operatingMode)
             putString(keyRadioModel, settings.radioModel)
             putString(keyTxRadioAddress, settings.txRadioAddress)
             putString(keyRxRadioAddress, settings.rxRadioAddress)
@@ -393,6 +395,7 @@ class SettingsRepo(
 
     private fun getRadioControlSettings(): RadioControlSettings = RadioControlSettings(
         enabled = preferences.getBoolean(keyRadioControlEnabled, false),
+        operatingMode = preferences.getString(keyOperatingMode, null) ?: RadioControlSettings.MODE_DUPLEX,
         radioModel = preferences.getString(keyRadioModel, null) ?: "Yaesu FT-817/818",
         txRadioAddress = preferences.getString(keyTxRadioAddress, null) ?: "",
         rxRadioAddress = preferences.getString(keyRxRadioAddress, null) ?: "",

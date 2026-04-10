@@ -38,7 +38,7 @@ class Ft817Controller(
     private val tag = "FT817"
     private val sppId: UUID = UUID.fromString("00001101-0000-1000-8000-00805f9b34fb")
     private val ioMutex = Mutex()
-    private val commandDelayMs = 200L
+    private val commandDelayMs = 100L
 
     private var socket: BluetoothSocket? = null
     private var outputStream: OutputStream? = null
@@ -124,6 +124,16 @@ class Ft817Controller(
 
     override suspend fun pttOff(): Boolean = withContext(Dispatchers.IO) {
         ioMutex.withLock { sendCommandWithAck(Ft817CatProtocol.buildPttOffCommand()) }
+    }
+
+    override suspend fun toggleVfo(): Boolean = withContext(Dispatchers.IO) {
+        ioMutex.withLock { sendCommandWithAck(Ft817CatProtocol.buildToggleVfoCommand()) }
+    }
+
+    override suspend fun setSplit(enabled: Boolean): Boolean = withContext(Dispatchers.IO) {
+        val cmd = if (enabled) Ft817CatProtocol.buildSplitOnCommand()
+        else Ft817CatProtocol.buildSplitOffCommand()
+        ioMutex.withLock { sendCommandWithAck(cmd) }
     }
 
     private suspend fun sendCommand(bytes: ByteArray): Boolean {

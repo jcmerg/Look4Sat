@@ -50,6 +50,26 @@ class RadioTrackingService(
     private var txController: IRadioController? = null
     private var rxController: IRadioController? = null
     private var trackingJob: Job? = null
+    private var onVfoB = false // tracks current VFO state in simplex mode
+
+    private fun createController(address: String): IRadioController {
+        val model = settingsRepo.radioControlSettings.value.radioModel
+        return if (model.startsWith("Icom")) {
+            Ic705Controller(bluetoothManager, address)
+        } else {
+            Ft817Controller(bluetoothManager, address)
+        }
+    }
+
+    /** Switch to VFO A if not already there. */
+    private suspend fun ensureVfoA(radio: IRadioController) {
+        if (onVfoB) { radio.toggleVfo(); onVfoB = false }
+    }
+
+    /** Switch to VFO B if not already there. */
+    private suspend fun ensureVfoB(radio: IRadioController) {
+        if (!onVfoB) { radio.toggleVfo(); onVfoB = true }
+    }
 
     override suspend fun connectRadios() {
         // Disconnect old controllers if any
@@ -58,40 +78,71 @@ class RadioTrackingService(
 
         // Read current addresses from settings
         val rcSettings = settingsRepo.radioControlSettings.value
+        val simplex = rcSettings.isSimplex
         val txAddr = rcSettings.txRadioAddress
         val rxAddr = rcSettings.rxRadioAddress
 
-        Log.i(tag, "Connecting TX=$txAddr RX=$rxAddr")
+        Log.i(tag, "Connecting mode=${rcSettings.operatingMode} TX=$txAddr RX=$rxAddr")
 
-        if (txAddr.isBlank() && rxAddr.isBlank()) {
-            _state.update { it.copy(errorMessage = "No radio addresses configured. Set them in Settings → FT-817.") }
-            return
-        }
+        if (simplex) {
+            // Simplex: single radio on txRadioAddress, split VFO A/B
+            if (txAddr.isBlank()) {
+                _state.update { it.copy(errorMessage = "No radio address configured. Set it in Settings → FT-817.") }
+                return
+            }
+            val radio = createController(txAddr)
+            txController = radio
+            rxController = null
 
-        val tx = Ft817Controller(bluetoothManager, txAddr)
-        val rx = Ft817Controller(bluetoothManager, rxAddr)
-        txController = tx
-        rxController = rx
+            _state.update { it.copy(errorMessage = null) }
+            val ok = radio.connect()
+            if (ok) {
+                onVfoB = false // assume VFO A after connect
+                Log.i(tag, "Connected to $txAddr, starting on VFO A")
+            }
+            _state.update {
+                it.copy(
+                    txConnected = ok,
+                    rxConnected = ok,
+                    errorMessage = if (!ok) "Could not connect to radio ($txAddr)" else null
+                )
+            }
+        } else {
+            // Duplex: two separate radios
+            if (txAddr.isBlank() && rxAddr.isBlank()) {
+                _state.update { it.copy(errorMessage = "No radio addresses configured. Set them in Settings → FT-817.") }
+                return
+            }
+            val tx = createController(txAddr)
+            val rx = createController(rxAddr)
+            txController = tx
+            rxController = rx
 
-        _state.update { it.copy(errorMessage = null) }
-        val txOk = if (txAddr.isNotBlank()) tx.connect() else false
-        val rxOk = if (rxAddr.isNotBlank()) rx.connect() else false
-        _state.update {
-            it.copy(
-                txConnected = txOk,
-                rxConnected = rxOk,
-                errorMessage = when {
-                    !txOk && !rxOk -> "Could not connect to TX and RX radios"
-                    !txOk -> "Could not connect to TX radio ($txAddr)"
-                    !rxOk -> "Could not connect to RX radio ($rxAddr)"
-                    else -> null
-                }
-            )
+            _state.update { it.copy(errorMessage = null) }
+            val txOk = if (txAddr.isNotBlank()) tx.connect() else false
+            val rxOk = if (rxAddr.isNotBlank()) rx.connect() else false
+            _state.update {
+                it.copy(
+                    txConnected = txOk,
+                    rxConnected = rxOk,
+                    errorMessage = when {
+                        !txOk && !rxOk -> "Could not connect to TX and RX radios"
+                        !txOk -> "Could not connect to TX radio ($txAddr)"
+                        !rxOk -> "Could not connect to RX radio ($rxAddr)"
+                        else -> null
+                    }
+                )
+            }
         }
     }
 
     override suspend fun disconnectRadios() {
         stopTracking()
+        val simplex = settingsRepo.radioControlSettings.value.isSimplex
+        if (simplex) {
+            txController?.setSplit(false)
+            Log.i(tag, "Split mode disabled")
+        }
         txController?.disconnect()
         rxController?.disconnect()
         txController = null
@@ -115,8 +166,8 @@ class RadioTrackingService(
             )
         }
         trackingJob?.cancel()
+        val simplex = settingsRepo.radioControlSettings.value.isSimplex
         trackingJob = appScope.launch {
-            // Set modes on both radios at tracking start
             val tx = txController
             val rx = rxController
             val txMode = transponder.uplinkMode
@@ -124,19 +175,82 @@ class RadioTrackingService(
                 ?: transponder.uplinkMode?.let {
                     TransponderMapper.mapUplinkModeToDownlinkMode(it, transponder.isInverted)
                 }
-            if (tx != null && tx.isConnected && txMode != null) {
-                tx.setMode(txMode)
-                Log.i(tag, "TX mode set to $txMode")
-            }
-            if (rx != null && rx.isConnected && rxMode != null) {
-                rx.setMode(rxMode)
-                Log.i(tag, "RX mode set to $rxMode")
-            }
-            // Set CTCSS if FM
-            if (txMode?.uppercase() == "FM") {
-                _state.value.ctcssTone?.let { tone ->
-                    tx?.setCtcssTone(tone)
-                    tx?.setCtcssMode(true)
+
+            if (simplex && tx != null && tx.isConnected) {
+                // Simplex: set up both VFOs, then enable split
+                val ic705 = tx as? Ic705Controller
+                if (ic705 != null) {
+                    // IC-705: select VFOs directly
+                    ic705.selectVfo(false) // VFO A
+                    if (rxMode != null) {
+                        tx.setMode(rxMode)
+                        Log.i(tag, "Simplex VFO A (RX) mode set to $rxMode")
+                    }
+                    val initRxFreq = if (txBaseFreqHz != null) {
+                        TransponderMapper.mapUplinkToDownlink(txBaseFreqHz, transponder)
+                    } else {
+                        transponder.downlinkLow
+                    }
+                    initRxFreq?.let { tx.setFrequency(it) }
+
+                    ic705.selectVfo(true) // VFO B
+                    if (txMode != null) {
+                        tx.setMode(txMode)
+                        Log.i(tag, "Simplex VFO B (TX) mode set to $txMode")
+                    }
+                    if (txMode?.uppercase() == "FM") {
+                        _state.value.ctcssTone?.let { tone ->
+                            tx.setCtcssTone(tone)
+                            tx.setCtcssMode(true)
+                        }
+                    }
+                    txBaseFreqHz?.let { tx.setFrequency(it) }
+                    ic705.selectVfo(false) // back to VFO A
+                } else {
+                    // FT-817: use toggle-based VFO switching
+                    ensureVfoA(tx)
+                    if (rxMode != null) {
+                        tx.setMode(rxMode)
+                        Log.i(tag, "Simplex VFO A (RX) mode set to $rxMode")
+                    }
+                    val initRxFreq = if (txBaseFreqHz != null) {
+                        TransponderMapper.mapUplinkToDownlink(txBaseFreqHz, transponder)
+                    } else {
+                        transponder.downlinkLow
+                    }
+                    initRxFreq?.let { tx.setFrequency(it) }
+
+                    ensureVfoB(tx)
+                    if (txMode != null) {
+                        tx.setMode(txMode)
+                        Log.i(tag, "Simplex VFO B (TX) mode set to $txMode")
+                    }
+                    if (txMode?.uppercase() == "FM") {
+                        _state.value.ctcssTone?.let { tone ->
+                            tx.setCtcssTone(tone)
+                            tx.setCtcssMode(true)
+                        }
+                    }
+                    txBaseFreqHz?.let { tx.setFrequency(it) }
+                    ensureVfoA(tx)
+                }
+                tx.setSplit(true)
+                Log.i(tag, "Split mode enabled after VFO setup")
+            } else {
+                // Duplex: set modes on separate radios
+                if (tx != null && tx.isConnected && txMode != null) {
+                    tx.setMode(txMode)
+                    Log.i(tag, "TX mode set to $txMode")
+                }
+                if (rx != null && rx.isConnected && rxMode != null) {
+                    rx.setMode(rxMode)
+                    Log.i(tag, "RX mode set to $rxMode")
+                }
+                if (txMode?.uppercase() == "FM") {
+                    _state.value.ctcssTone?.let { tone ->
+                        tx?.setCtcssTone(tone)
+                        tx?.setCtcssMode(true)
+                    }
                 }
             }
             _state.update { it.copy(txMode = txMode, rxMode = rxMode) }
@@ -146,6 +260,7 @@ class RadioTrackingService(
             var tuningRadio = "" // "", "tx", or "rx" - which radio the user is tuning
             var lastReadFreq = 0L
             var stableCount = 0
+            var tickCount = 0
 
             while (isActive) {
                 val currentState = _state.value
@@ -158,113 +273,227 @@ class RadioTrackingService(
                 val timeNow = System.currentTimeMillis()
 
                 val pos = satelliteRepo.getPosition(satPass.orbitalObject, stationPos, timeNow)
-                val tx = txController
-                val rx = rxController
                 val hasUplink = txBaseFreq != null
-                val c = com.rtbishop.look4sat.core.domain.predict.SPEED_OF_LIGHT
-                val v = pos.distanceRate * 1000.0
 
-                if (tuningRadio.isNotEmpty()) {
-                    // --- User is tuning: keep reading, wait for stabilization ---
-                    val radio = if (tuningRadio == "tx") tx else rx
+                if (simplex) {
+                    // --- Simplex: single radio, VFO A/B switching ---
+                    val radio = tx
                     if (radio != null && radio.isConnected) {
-                        val readResult = radio.readFrequencyAndMode()
-                        if (readResult != null) {
-                            val (freq, _) = readResult
-                            if (kotlin.math.abs(freq - lastReadFreq) <= 20) {
-                                stableCount++
-                            } else {
-                                stableCount = 0
-                                lastReadFreq = freq
-                            }
-                            // Stable for 2 reads → user stopped turning
-                            if (stableCount >= 2) {
-                                if (tuningRadio == "tx" && txBaseFreq != null) {
-                                    val newBase = (freq.toDouble() * c / (c + v)).toLong()
-                                    if (newBase > 0) {
-                                        txBaseFreq = newBase
-                                        _state.update { it.copy(txBaseFrequencyHz = newBase) }
-                                        Log.i(tag, "TX tuning done → base=$newBase")
+                        if (tuningRadio.isNotEmpty()) {
+                            // User is tuning on VFO A (RX): read and wait for stabilization
+                            val readResult = radio.readFrequencyAndMode()
+                            if (readResult != null) {
+                                val (freq, _) = readResult
+                                if (kotlin.math.abs(freq - lastReadFreq) <= 20) {
+                                    stableCount++
+                                } else {
+                                    stableCount = 0
+                                    lastReadFreq = freq
+                                }
+                                if (stableCount >= 1) {
+                                    // Apply user's tuning delta directly to txBase
+                                    val rxDelta = freq - lastSetRxFreq.toLong()
+                                    val currentTxBase = _state.value.txBaseFrequencyHz
+                                    if (currentTxBase != null) {
+                                        val newTxBase = if (xpdr.isInverted) {
+                                            currentTxBase - rxDelta
+                                        } else {
+                                            currentTxBase + rxDelta
+                                        }
+                                        if (newTxBase > 0) {
+                                            txBaseFreq = newTxBase
+                                            _state.update { it.copy(txBaseFrequencyHz = newTxBase) }
+                                            Log.i(tag, "Simplex tuning done → delta=$rxDelta, txBase=$newTxBase")
+                                        }
                                     }
-                                } else if (tuningRadio == "rx") {
-                                    val rxNominal = (freq.toDouble() * c / (c - v)).toLong()
-                                    val newTxBase = TransponderMapper.mapDownlinkToUplink(rxNominal, xpdr)
-                                    if (newTxBase != null && newTxBase > 0) {
-                                        txBaseFreq = newTxBase
-                                        _state.update { it.copy(txBaseFrequencyHz = newTxBase) }
-                                        Log.i(tag, "RX tuning done → txBase=$newTxBase")
+                                    tuningRadio = ""
+                                    stableCount = 0
+                                    lastSetRxFreq = 0.0
+                                    lastSetTxFreq = 0.0
+                                }
+                            }
+                        } else {
+                            // Dial feedback: read VFO A before setting, detect user tuning
+                            if (lastSetRxFreq > 0.0) {
+                                ensureVfoA(radio)
+                                val readResult = radio.readFrequencyAndMode()
+                                if (readResult != null) {
+                                    val (actualRxFreq, _) = readResult
+                                    if (kotlin.math.abs(actualRxFreq - lastSetRxFreq) >= 20.0) {
+                                        tuningRadio = "rx"
+                                        lastReadFreq = actualRxFreq
+                                        stableCount = 0
+                                        Log.i(tag, "Simplex tuning detected (read=$actualRxFreq, lastSet=$lastSetRxFreq)")
                                     }
                                 }
-                                tuningRadio = ""
-                                stableCount = 0
-                                lastSetTxFreq = 0.0
-                                lastSetRxFreq = 0.0
+                            }
+
+                            // Compute Doppler-corrected frequencies (after tuning may have updated txBaseFreq)
+                            val txRadioFreqNow = txBaseFreq?.let { pos.getUplinkFreq(it) }
+                            val rxBaseFreqNow = if (txBaseFreq != null) {
+                                TransponderMapper.mapUplinkToDownlink(txBaseFreq, xpdr)
+                            } else {
+                                xpdr.downlinkLow
+                            }
+                            val rxRadioFreqNow = rxBaseFreqNow?.let { pos.getDownlinkFreq(it) }
+
+                            // Set frequencies (skip if user is tuning)
+                            if (tuningRadio.isEmpty()) {
+                                val ic705 = radio as? Ic705Controller
+                                if (ic705 != null) {
+                                    // IC-705: set both VFOs without toggling (Cmd 0x25)
+                                    if (rxRadioFreqNow != null) {
+                                        ic705.setFrequencyOnVfo(false, rxRadioFreqNow)
+                                        lastSetRxFreq = rxRadioFreqNow.toDouble()
+                                    }
+                                    if (txRadioFreqNow != null) {
+                                        ic705.setFrequencyOnVfo(true, txRadioFreqNow)
+                                        lastSetTxFreq = txRadioFreqNow.toDouble()
+                                    }
+                                } else {
+                                    // FT-817: toggle VFO A/B to set frequencies
+                                    if (rxRadioFreqNow != null) {
+                                        ensureVfoA(radio)
+                                        radio.setFrequency(rxRadioFreqNow)
+                                        lastSetRxFreq = rxRadioFreqNow.toDouble()
+                                    }
+                                    if (txRadioFreqNow != null) {
+                                        val txDrift = kotlin.math.abs(txRadioFreqNow - lastSetTxFreq)
+                                        if (lastSetTxFreq == 0.0 || txDrift >= 50.0) {
+                                            ensureVfoB(radio)
+                                            radio.setFrequency(txRadioFreqNow)
+                                            lastSetTxFreq = txRadioFreqNow.toDouble()
+                                            ensureVfoA(radio)
+                                        }
+                                    }
+                                }
                             }
                         }
+                    }
+
+                    // Use latest computed frequencies for state update
+                    val txRadioFreq = txBaseFreq?.let { pos.getUplinkFreq(it) }
+                    val rxBaseFreq = if (txBaseFreq != null) {
+                        TransponderMapper.mapUplinkToDownlink(txBaseFreq, xpdr)
+                    } else {
+                        xpdr.downlinkLow
+                    }
+                    val rxRadioFreq = rxBaseFreq?.let { pos.getDownlinkFreq(it) }
+
+                    _state.update {
+                        it.copy(
+                            txConnected = radio?.isConnected ?: false,
+                            rxConnected = radio?.isConnected ?: false,
+                            txFrequencyHz = txRadioFreq,
+                            rxFrequencyHz = rxRadioFreq,
+                            azimuth = Math.toDegrees(pos.azimuth),
+                            elevation = Math.toDegrees(pos.elevation),
+                            distance = pos.distance
+                        )
                     }
                 } else {
-                    // --- Normal tracking: read, detect changes, command ---
+                    // --- Duplex: two separate radios ---
+                    val c = com.rtbishop.look4sat.core.domain.predict.SPEED_OF_LIGHT
+                    val v = pos.distanceRate * 1000.0
 
-                    // TX dial feedback
-                    if (hasUplink && tx != null && tx.isConnected && lastSetTxFreq > 0.0) {
-                        val readResult = tx.readFrequencyAndMode()
-                        if (readResult != null) {
-                            val (actualTxFreq, _) = readResult
-                            if (kotlin.math.abs(actualTxFreq - lastSetTxFreq) >= 20.0) {
-                                tuningRadio = "tx"
-                                lastReadFreq = actualTxFreq
-                                stableCount = 0
-                                Log.i(tag, "TX tuning detected (read=$actualTxFreq, lastSet=$lastSetTxFreq)")
+                    if (tuningRadio.isNotEmpty()) {
+                        val radio = if (tuningRadio == "tx") tx else rx
+                        if (radio != null && radio.isConnected) {
+                            val readResult = radio.readFrequencyAndMode()
+                            if (readResult != null) {
+                                val (freq, _) = readResult
+                                if (kotlin.math.abs(freq - lastReadFreq) <= 20) {
+                                    stableCount++
+                                } else {
+                                    stableCount = 0
+                                    lastReadFreq = freq
+                                }
+                                if (stableCount >= 1) {
+                                    if (tuningRadio == "tx" && txBaseFreq != null) {
+                                        val newBase = (freq.toDouble() * c / (c + v)).toLong()
+                                        if (newBase > 0) {
+                                            txBaseFreq = newBase
+                                            _state.update { it.copy(txBaseFrequencyHz = newBase) }
+                                            Log.i(tag, "TX tuning done → base=$newBase")
+                                        }
+                                    } else if (tuningRadio == "rx") {
+                                        val rxNominal = (freq.toDouble() * c / (c - v)).toLong()
+                                        val newTxBase = TransponderMapper.mapDownlinkToUplink(rxNominal, xpdr)
+                                        if (newTxBase != null && newTxBase > 0) {
+                                            txBaseFreq = newTxBase
+                                            _state.update { it.copy(txBaseFrequencyHz = newTxBase) }
+                                            Log.i(tag, "RX tuning done → txBase=$newTxBase")
+                                        }
+                                    }
+                                    tuningRadio = ""
+                                    stableCount = 0
+                                    lastSetTxFreq = 0.0
+                                    lastSetRxFreq = 0.0
+                                }
+                            }
+                        }
+                    } else {
+                        // TX dial feedback
+                        if (hasUplink && tx != null && tx.isConnected && lastSetTxFreq > 0.0) {
+                            val readResult = tx.readFrequencyAndMode()
+                            if (readResult != null) {
+                                val (actualTxFreq, _) = readResult
+                                if (kotlin.math.abs(actualTxFreq - lastSetTxFreq) >= 20.0) {
+                                    tuningRadio = "tx"
+                                    lastReadFreq = actualTxFreq
+                                    stableCount = 0
+                                    Log.i(tag, "TX tuning detected (read=$actualTxFreq, lastSet=$lastSetTxFreq)")
+                                }
+                            }
+                        }
+
+                        // RX dial feedback (only if TX not tuning)
+                        if (tuningRadio.isEmpty() && rx != null && rx.isConnected && lastSetRxFreq > 0.0) {
+                            val readResult = rx.readFrequencyAndMode()
+                            if (readResult != null) {
+                                val (actualRxFreq, _) = readResult
+                                if (kotlin.math.abs(actualRxFreq - lastSetRxFreq) >= 20.0) {
+                                    tuningRadio = "rx"
+                                    lastReadFreq = actualRxFreq
+                                    stableCount = 0
+                                    Log.i(tag, "RX tuning detected (read=$actualRxFreq, lastSet=$lastSetRxFreq)")
+                                }
                             }
                         }
                     }
 
-                    // RX dial feedback (only if TX not tuning)
-                    if (tuningRadio.isEmpty() && rx != null && rx.isConnected && lastSetRxFreq > 0.0) {
-                        val readResult = rx.readFrequencyAndMode()
-                        if (readResult != null) {
-                            val (actualRxFreq, _) = readResult
-                            if (kotlin.math.abs(actualRxFreq - lastSetRxFreq) >= 20.0) {
-                                tuningRadio = "rx"
-                                lastReadFreq = actualRxFreq
-                                stableCount = 0
-                                Log.i(tag, "RX tuning detected (read=$actualRxFreq, lastSet=$lastSetRxFreq)")
-                            }
+                    // Compute Doppler-corrected frequencies (after tuning may have updated txBaseFreq)
+                    val txRadioFreq = txBaseFreq?.let { pos.getUplinkFreq(it) }
+                    val rxBaseFreq = if (txBaseFreq != null) {
+                        TransponderMapper.mapUplinkToDownlink(txBaseFreq, xpdr)
+                    } else {
+                        xpdr.downlinkLow
+                    }
+                    val rxRadioFreq = rxBaseFreq?.let { pos.getDownlinkFreq(it) }
+
+                    // Command radios (only when not tuning)
+                    if (tuningRadio.isEmpty()) {
+                        if (tx != null && tx.isConnected && txRadioFreq != null) {
+                            tx.setFrequency(txRadioFreq)
+                            lastSetTxFreq = txRadioFreq.toDouble()
+                        }
+                        if (rx != null && rx.isConnected && rxRadioFreq != null) {
+                            rx.setFrequency(rxRadioFreq)
+                            lastSetRxFreq = rxRadioFreq.toDouble()
                         }
                     }
-                }
 
-                // Compute Doppler-corrected frequencies
-                val txRadioFreq = txBaseFreq?.let { pos.getUplinkFreq(it) }
-                val rxBaseFreq = if (txBaseFreq != null) {
-                    TransponderMapper.mapUplinkToDownlink(txBaseFreq, xpdr)
-                } else {
-                    xpdr.downlinkLow
-                }
-                val rxRadioFreq = rxBaseFreq?.let { pos.getDownlinkFreq(it) }
-
-                // Command radios (only when not tuning)
-                if (tuningRadio.isEmpty()) {
-                    if (tx != null && tx.isConnected && txRadioFreq != null) {
-                        tx.setFrequency(txRadioFreq)
-                        lastSetTxFreq = txRadioFreq.toDouble()
+                    _state.update {
+                        it.copy(
+                            txConnected = tx?.isConnected ?: false,
+                            rxConnected = rx?.isConnected ?: false,
+                            txFrequencyHz = txRadioFreq,
+                            rxFrequencyHz = rxRadioFreq,
+                            azimuth = Math.toDegrees(pos.azimuth),
+                            elevation = Math.toDegrees(pos.elevation),
+                            distance = pos.distance
+                        )
                     }
-                    if (rx != null && rx.isConnected && rxRadioFreq != null) {
-                        rx.setFrequency(rxRadioFreq)
-                        lastSetRxFreq = rxRadioFreq.toDouble()
-                    }
-                }
-
-                _state.update {
-                    it.copy(
-                        txConnected = tx?.isConnected ?: false,
-                        rxConnected = rx?.isConnected ?: false,
-                        txFrequencyHz = txRadioFreq,
-                        rxFrequencyHz = rxRadioFreq,
-                        azimuth = Math.toDegrees(pos.azimuth),
-                        elevation = Math.toDegrees(pos.elevation),
-                        distance = pos.distance
-                    )
                 }
 
                 delay(1000)
@@ -279,20 +508,40 @@ class RadioTrackingService(
     }
 
     override fun setTransponder(transponder: SatRadio) {
+        val simplex = settingsRepo.radioControlSettings.value.isSimplex
         appScope.launch {
             val tx = txController
             val rx = rxController
-            transponder.uplinkMode?.let { tx?.setMode(it) }
             val rxMode = transponder.downlinkMode
                 ?: transponder.uplinkMode?.let {
                     TransponderMapper.mapUplinkModeToDownlinkMode(it, transponder.isInverted)
                 }
-            rxMode?.let { rx?.setMode(it) }
-
-            if (transponder.uplinkMode?.uppercase() == "FM") {
-                _state.value.ctcssTone?.let { tone ->
-                    tx?.setCtcssTone(tone)
-                    tx?.setCtcssMode(true)
+            if (simplex && tx != null && tx.isConnected) {
+                // Simplex: set modes via VFO toggle on single radio
+                if (rxMode != null) {
+                    ensureVfoA(tx)
+                    tx.setMode(rxMode)
+                }
+                if (transponder.uplinkMode != null) {
+                    ensureVfoB(tx)
+                    tx.setMode(transponder.uplinkMode!!)
+                }
+                if (transponder.uplinkMode?.uppercase() == "FM") {
+                    _state.value.ctcssTone?.let { tone ->
+                        tx.setCtcssTone(tone)
+                        tx.setCtcssMode(true)
+                    }
+                }
+                ensureVfoA(tx)
+            } else {
+                // Duplex: separate radios
+                transponder.uplinkMode?.let { tx?.setMode(it) }
+                rxMode?.let { rx?.setMode(it) }
+                if (transponder.uplinkMode?.uppercase() == "FM") {
+                    _state.value.ctcssTone?.let { tone ->
+                        tx?.setCtcssTone(tone)
+                        tx?.setCtcssMode(true)
+                    }
                 }
             }
         }
@@ -335,21 +584,38 @@ class RadioTrackingService(
 
     override fun setCtcssTone(toneHz: Double?) {
         _state.update { it.copy(ctcssTone = toneHz) }
+        val simplex = settingsRepo.radioControlSettings.value.isSimplex
         appScope.launch {
-            val tx = txController
-            if (toneHz != null) {
-                tx?.setCtcssTone(toneHz)
-                tx?.setCtcssMode(true)
-            } else {
-                tx?.setCtcssMode(false)
+            val radio = txController
+            if (radio != null && radio.isConnected) {
+                if (simplex) ensureVfoB(radio)
+                if (toneHz != null) {
+                    radio.setCtcssTone(toneHz)
+                    radio.setCtcssMode(true)
+                } else {
+                    radio.setCtcssMode(false)
+                }
+                if (simplex) ensureVfoA(radio)
             }
         }
     }
 
     override fun setMode(txMode: String, rxMode: String) {
+        val simplex = settingsRepo.radioControlSettings.value.isSimplex
         appScope.launch {
-            txController?.setMode(txMode)
-            rxController?.setMode(rxMode)
+            if (simplex) {
+                val radio = txController
+                if (radio != null && radio.isConnected) {
+                    ensureVfoA(radio)
+                    radio.setMode(rxMode)
+                    ensureVfoB(radio)
+                    radio.setMode(txMode)
+                    ensureVfoA(radio)
+                }
+            } else {
+                txController?.setMode(txMode)
+                rxController?.setMode(rxMode)
+            }
         }
         _state.update { it.copy(txMode = txMode, rxMode = rxMode) }
     }
